@@ -1,0 +1,9 @@
+# PlatformIO build output and editor files
+.pio/
+.vscode/
+.DS_Store
+# real passwords - never commit
+shared/secrets.h
+# Python
+__pycache__/
+.venv/
