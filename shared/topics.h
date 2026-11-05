@@ -11,7 +11,7 @@
 
 // ===== Change these =====
 const std::string SECTION   = "Wednesday";   // or "Friday"
-const std::string USER_ACQ  = "atu8211";              // device A logs in with this
+const std::string USER_ACQ  = "jbejaranoherrer7056";  // device A logs in with this
 const std::string USER_DISP = "cgomezguerrero5580";   // device B
 const std::string USER_CTRL = "dzou1734";             // device C
 // ========================

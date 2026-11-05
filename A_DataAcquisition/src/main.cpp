@@ -20,8 +20,8 @@
  *   The loop never blocks: each task runs on its own millis() timer and
  *   delay() is not used anywhere.
  *
- *   mic/clip payload: raw PCM, signed 16-bit little-endian, mono, 44100 Hz,
- *   48000 samples = 96000 bytes (about 1.1 s), oldest sample first.
+ *   mic/clip payload: raw PCM, signed 16-bit little-endian, mono, 22050 Hz,
+ *   24000 samples = 48000 bytes (about 1.1 s), oldest sample first.
  */
 
 #include <M5Unified.h>
@@ -47,11 +47,14 @@ const uint32_t WIFI_RETRY     = 10000;
 const uint32_t MQTT_RETRY     = 5000;
 const uint16_t KEEPALIVE_SEC = 15;     // seconds; Last Will fires ~1.5x this after a drop
 
-// ---------------- audio (same sizes as Lab 4) ----------------
-const size_t   RECORD_NUMBER     = 200;                            // chunks in the ring buffer
-const size_t   RECORD_LENGTH     = 240;                            // samples per chunk
-const size_t   RECORD_SIZE       = RECORD_NUMBER * RECORD_LENGTH;  // 48000 samples
-const uint32_t RECORD_SAMPLERATE = 44100;
+// ---------------- audio ----------------
+// Same length as Lab 4 (~1.1 s), but at 22050 Hz so one clip is 48 KB (PubSubClient
+// cannot send or receive a message of 64 KB or more). 20 large chunks instead of 200 small ones:
+// the mic queue holds 2 chunks, so loop() may stall up to ~54-108 ms without a gap.
+const size_t   RECORD_NUMBER     = 20;                             // chunks in the ring buffer
+const size_t   RECORD_LENGTH     = 1200;                           // samples per chunk (~54 ms)
+const size_t   RECORD_SIZE       = RECORD_NUMBER * RECORD_LENGTH;  // 24000 samples = 48000 bytes
+const uint32_t RECORD_SAMPLERATE = 22050;   // half of Lab 4: PubSubClient messages must stay under 64 KB
 const size_t   AUDIO_WRITE_CHUNK = 2048;                           // bytes per network write
 
 // ---------------- objects and state ----------------
@@ -63,7 +66,7 @@ QMP6988 qmp;
 bool    sht_ok = false;
 bool    qmp_ok = false;
 
-int16_t* rec_data = nullptr;   // ring buffer, 96000 bytes
+int16_t* rec_data = nullptr;   // ring buffer, 48000 bytes
 size_t   rec_idx  = 0;         // next chunk to fill = oldest chunk
 
 bool data_enabled    = true;   // set by C via control/data (retained)
@@ -101,7 +104,7 @@ void setup()
     M5.Display.fillScreen(BLACK);
     M5.Display.setTextSize(1.5f);
 
-    setupMic();   // take the 96 KB buffer first, before WiFi and TLS use the heap
+    setupMic();   // take the 48 KB buffer first, before WiFi and TLS use the heap
     setupEnv();
 
     WiFi.mode(WIFI_STA);
@@ -301,7 +304,7 @@ void sendAudio()
     const size_t split  = rec_idx * RECORD_LENGTH;               // first sample of oldest chunk
     const uint8_t* bytes = (const uint8_t*)rec_data;
 
-    // beginPublish/write/endPublish streams the payload, so no 96 KB MQTT buffer is needed.
+    // beginPublish/write/endPublish streams the payload, so no 48 KB MQTT buffer is needed.
     bool ok = mqtt.beginPublish(T_MIC_CLIP.c_str(), total, false);
     if (ok) {
         ok = writeAudio(bytes + split * 2, (RECORD_SIZE - split) * 2)   // oldest .. end

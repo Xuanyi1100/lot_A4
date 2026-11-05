@@ -1,0 +1,407 @@
+<!doctype html>
+<!--
+  FILE          : index.html
+  PROJECT       : SENG3030 Assignment 4 - D (Client UI)
+  PROGRAMMERS   : Alexia Tu, Carlos Gomez Guerrero, Deyi Zou, Juan Jose Bejarano
+  FIRST VERSION : 2026-11-05
+  DESCRIPTION   :
+    Browser dashboard for the A4 system. Connects to the course EMQX broker
+    with MQTT over secure WebSocket (wss, port 8084), subscribes to
+    SENG3030/Wednesday/<A|B|C>/# and shows:
+      - online / offline status of devices A, B and C (Last Will messages)
+      - A's data switch as set by C (control/data)
+      - every sensor value from A, with its age; old values turn red
+        (after 5 s, or 25 s for the battery, which A sends every 10 s)
+      - live charts: temperature, acceleration, gyroscope
+      - audio clips from A (mic/clip): play in the browser or save as .wav
+      - a log of the latest MQTT messages
+    Subscribe-only: this page never publishes.
+    Open the file in a browser (internet needed for the two libraries),
+    type the MQTT username and password, press Connect.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A4 Client Dashboard</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1f2933; --muted: #6b7785; --line: #dde2e8;
+    --ok: #12805c; --bad: #c62828; --warn: #b26a00; --accent: #2563eb;
+    --c1: #2563eb; --c2: #d97706; --c3: #059669;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a; --card: #1b2028; --ink: #e6e9ee; --muted: #8d97a5; --line: #2c333d;
+      --ok: #34c38f; --bad: #ef5350; --warn: #f0a33a; --accent: #6b9cff;
+      --c1: #6b9cff; --c2: #f0a33a; --c3: #34c38f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center;
+           padding: 14px 20px; background: var(--card); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 18px; margin: 0; flex: 1 1 auto; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  input { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+          background: var(--bg); color: var(--ink); width: 180px; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
+           background: var(--card); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  .row { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+          border: 1px solid var(--line); font-size: 13px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .on  .dot { background: var(--ok); }  .off .dot { background: var(--bad); }
+  .on { color: var(--ok); } .off { color: var(--bad); }
+  .status { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: baseline; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; text-align: right; }
+  .kv .v small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+  .age { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .age.stale { color: var(--bad); font-weight: 600; }
+  .chart { position: relative; height: 200px; }
+  ul.clips { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  ul.clips li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between;
+                padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .empty { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
+  td { padding: 4px 6px; border-bottom: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td:first-child { width: 80px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  td:nth-child(2) { width: 45%; font-family: ui-monospace, Menlo, monospace; }
+  .log { max-height: 260px; overflow: auto; }
+  #err { color: var(--bad); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SENG3030 A4 · Client Dashboard</h1>
+  <form id="login">
+    <input id="user" placeholder="MQTT username" autocomplete="username" required>
+    <input id="pass" type="password" placeholder="password" autocomplete="current-password" required>
+    <button class="primary" id="connectBtn" type="submit">Connect</button>
+  </form>
+  <span class="pill" id="conn"><span class="dot"></span><span>disconnected</span></span>
+  <span id="err"></span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Devices</h2>
+    <div class="status">
+      <span class="pill" id="st-A"><span class="dot"></span>A · Acquisition: ?</span>
+      <span class="pill" id="st-B"><span class="dot"></span>B · Display: ?</span>
+      <span class="pill" id="st-C"><span class="dot"></span>C · Control: ?</span>
+      <span class="pill" id="st-data"><span class="dot"></span>A data (set by C): ?</span>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="card">
+      <h2>SHT30</h2>
+      <div class="kv">
+        <span class="k">Temperature</span><span class="v" data-key="shtTemp" data-unit="°C" data-dp="2">--</span>
+        <span class="k">Humidity</span><span class="v" data-key="shtHumi" data-unit="%rH" data-dp="1">--</span>
+      </div>
+      <div class="age" data-age="shtTemp"></div>
+    </div>
+    <div class="card">
+      <h2>QMP6988</h2>
+      <div class="kv">
+        <span class="k">Temperature</span><span class="v" data-key="qmpTemp" data-unit="°C" data-dp="2">--</span>
+        <span class="k">Pressure</span><span class="v" data-key="qmpPres" data-unit="hPa" data-dp="1" data-scale="0.01">--</span>
+        <span class="k">Altitude</span><span class="v" data-key="qmpAlt" data-unit="m" data-dp="1">--</span>
+      </div>
+      <div class="age" data-age="qmpTemp"></div>
+    </div>
+    <div class="card">
+      <h2>Power</h2>
+      <div class="kv">
+        <span class="k">Battery</span><span class="v" data-key="battery" data-unit="V" data-dp="2" data-scale="0.001">--</span>
+      </div>
+      <div class="age" data-age="battery"></div>
+    </div>
+    <div class="card">
+      <h2>IMU</h2>
+      <div class="kv">
+        <span class="k">Accel x</span><span class="v" data-key="accel" data-idx="0" data-unit="g" data-dp="3">--</span>
+        <span class="k">Accel y</span><span class="v" data-key="accel" data-idx="1" data-unit="g" data-dp="3">--</span>
+        <span class="k">Accel z</span><span class="v" data-key="accel" data-idx="2" data-unit="g" data-dp="3">--</span>
+        <span class="k">Gyro x</span><span class="v" data-key="gyro" data-idx="0" data-unit="°/s" data-dp="1">--</span>
+        <span class="k">Gyro y</span><span class="v" data-key="gyro" data-idx="1" data-unit="°/s" data-dp="1">--</span>
+        <span class="k">Gyro z</span><span class="v" data-key="gyro" data-idx="2" data-unit="°/s" data-dp="1">--</span>
+      </div>
+      <div class="age" data-age="accel"></div>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="card"><h2>Temperature (°C)</h2><div class="chart"><canvas id="chTemp"></canvas></div></div>
+    <div class="card"><h2>Acceleration (g)</h2><div class="chart"><canvas id="chAccel"></canvas></div></div>
+    <div class="card"><h2>Gyroscope (°/s)</h2><div class="chart"><canvas id="chGyro"></canvas></div></div>
+  </section>
+
+  <section class="row">
+    <div class="card">
+      <h2>Audio clips from A</h2>
+      <ul class="clips" id="clips"><li class="empty">No clip yet. Hold BtnB on device C.</li></ul>
+    </div>
+    <div class="card">
+      <h2>Latest MQTT messages</h2>
+      <div class="log"><table><tbody id="log"></tbody></table></div>
+    </div>
+  </section>
+</main>
+
+<script>
+// ===================== configuration (must match shared/topics.h) =====================
+const CONFIG = {
+  url:        "wss://p07da41d.ala.us-east-1.emqxsl.com:8084/mqtt",
+  section:    "Wednesday",
+  userAcq:    "jbejaranoherrer7056",   // device A
+  userDisp:   "cgomezguerrero5580",    // device B
+  userCtrl:   "dzou1734",              // device C
+  defaultUser:"atu8211",               // D logs in with this account
+  clipRate:   22050,                   // mic/clip sample rate (Hz)
+  staleMs:    5000,                    // value is "stale" after this (sent every 0.2-1 s)
+  staleMsBattery: 25000,               // battery is sent every 10 s: allow one lost message
+  points:     60,                      // points kept in each chart
+  logRows:    40,                      // rows kept in the message log
+  maxClips:   10
+};
+
+const base = u => `SENG3030/${CONFIG.section}/${u}/`;
+const A = base(CONFIG.userAcq), B = base(CONFIG.userDisp), C = base(CONFIG.userCtrl);
+const T = {
+  shtTemp: A + "sht30/temperature", shtHumi: A + "sht30/humidity",
+  qmpTemp: A + "qmp/temperature",   qmpPres: A + "qmp/pressure", qmpAlt: A + "qmp/altitude",
+  battery: A + "battery", imu: A + "imu", micClip: A + "mic/clip",
+  statusA: A + "status", statusB: B + "status", statusC: C + "status",
+  ctrlData: C + "control/data", ctrlDisplay: C + "control/display", ctrlAudio: C + "control/audio"
+};
+const NUMERIC = { [T.shtTemp]: "shtTemp", [T.shtHumi]: "shtHumi", [T.qmpTemp]: "qmpTemp",
+                  [T.qmpPres]: "qmpPres", [T.qmpAlt]: "qmpAlt", [T.battery]: "battery" };
+
+// ===================== state =====================
+const readings = {};      // key -> { value, at }
+const clips = [];         // { at, samples: Int16Array }
+let client = null;
+let audioCtx = null;
+const $ = id => document.getElementById(id);
+
+// ===================== charts =====================
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+function makeChart(canvasId, names) {
+  const colors = [css("--c1"), css("--c2"), css("--c3")];
+  return new Chart($(canvasId), {
+    type: "line",
+    data: { labels: [], datasets: names.map((n, i) => ({
+      label: n, data: [], borderColor: colors[i], backgroundColor: colors[i],
+      borderWidth: 2, pointRadius: 0, tension: 0.25, spanGaps: false })) },
+    options: {
+      animation: false, responsive: true, maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: { legend: { labels: { color: css("--muted"), boxWidth: 12 } } },
+      scales: {
+        x: { ticks: { color: css("--muted"), maxTicksLimit: 6 }, grid: { color: css("--line") } },
+        y: { ticks: { color: css("--muted") }, grid: { color: css("--line") } }
+      }
+    }
+  });
+}
+const chTemp  = makeChart("chTemp",  ["SHT30", "QMP6988"]);
+const chAccel = makeChart("chAccel", ["x", "y", "z"]);
+const chGyro  = makeChart("chGyro",  ["x", "y", "z"]);
+
+function pushPoint(chart, values) {
+  const d = chart.data;
+  d.labels.push(new Date().toLocaleTimeString([], { hour12: false }));
+  values.forEach((v, i) => d.datasets[i].data.push(v));
+  if (d.labels.length > CONFIG.points) {
+    d.labels.shift();
+    d.datasets.forEach(ds => ds.data.shift());
+  }
+  chart.update("none");
+}
+
+// Temperature chart: one point per second; a stale value becomes a gap.
+setInterval(() => {
+  if (!client || !client.connected) return;
+  const fresh = k => readings[k] && Date.now() - readings[k].at < CONFIG.staleMs ? readings[k].value : null;
+  pushPoint(chTemp, [fresh("shtTemp"), fresh("qmpTemp")]);
+}, 1000);
+
+// ===================== MQTT =====================
+function connect(user, pass) {
+  if (client) client.end(true);
+  setConn("connecting…", null);
+  $("err").textContent = "";
+  client = mqtt.connect(CONFIG.url, {
+    username: user, password: pass,
+    clientId: "seng3030-D-" + Math.random().toString(16).slice(2, 10),
+    clean: true, reconnectPeriod: 5000, connectTimeout: 10000, keepalive: 30
+  });
+  client.on("connect", () => {
+    setConn("connected", true);
+    client.subscribe([A + "#", B + "#", C + "#"], { qos: 0 });
+    $("connectBtn").textContent = "Reconnect";
+  });
+  client.on("reconnect", () => setConn("reconnecting…", null));
+  client.on("close",     () => setConn("disconnected", false));
+  client.on("error",     e  => { $("err").textContent = e.message; });
+  client.on("message",   (topic, payload) => handleMessage(topic, new Uint8Array(payload)));
+}
+
+// Every message from the broker comes through here.
+function handleMessage(topic, bytes) {
+  if (topic === T.micClip) { addClip(bytes); log(topic, `[audio ${bytes.length} bytes]`); return; }
+
+  const text = new TextDecoder().decode(bytes).trim();
+  log(topic, text);
+  const now = Date.now();
+
+  if (topic in NUMERIC) {
+    readings[NUMERIC[topic]] = { value: parseFloat(text), at: now };
+  } else if (topic === T.imu) {
+    try {
+      const j = JSON.parse(text);
+      readings.accel = { value: [j.ax, j.ay, j.az], at: now };
+      readings.gyro  = { value: [j.gx, j.gy, j.gz], at: now };
+      pushPoint(chAccel, [j.ax, j.ay, j.az]);
+      pushPoint(chGyro,  [j.gx, j.gy, j.gz]);
+    } catch (e) { /* ignore a broken JSON message */ }
+  } else if (topic === T.statusA) setPill("st-A", "A · Acquisition", text);
+  else if (topic === T.statusB)   setPill("st-B", "B · Display", text);
+  else if (topic === T.statusC)   setPill("st-C", "C · Control", text);
+  else if (topic === T.ctrlData)  setPill("st-data", "A data (set by C)", text === "on" ? "ON" : "OFF", text === "on");
+  render();
+}
+
+// ===================== rendering =====================
+function render() {
+  const now = Date.now();
+  document.querySelectorAll("[data-key]").forEach(el => {
+    const r = readings[el.dataset.key];
+    if (!r) return;
+    const dp = el.dataset.dp ? +el.dataset.dp : null;
+    const scale = el.dataset.scale ? +el.dataset.scale : 1;
+    const fmt = v => (v * scale).toFixed(dp ?? 2);
+    const v = Array.isArray(r.value) ? r.value[+el.dataset.idx] : r.value;
+    const shown = fmt(+v);
+    el.innerHTML = `${shown}<small>${el.dataset.unit}</small>`;
+  });
+  document.querySelectorAll("[data-age]").forEach(el => {
+    const r = readings[el.dataset.age];
+    if (!r) { el.textContent = "no data yet"; el.classList.remove("stale"); return; }
+    const s = (now - r.at) / 1000;
+    const limit = el.dataset.age === "battery" ? CONFIG.staleMsBattery : CONFIG.staleMs;
+    const stale = now - r.at > limit;
+    el.textContent = stale ? `STALE · last update ${s.toFixed(0)} s ago` : `updated ${s.toFixed(1)} s ago`;
+    el.classList.toggle("stale", stale);
+  });
+}
+setInterval(render, 500);
+
+function setConn(text, ok) {
+  const el = $("conn");
+  el.className = "pill" + (ok === true ? " on" : ok === false ? " off" : "");
+  el.lastElementChild.textContent = text;
+}
+
+function setPill(id, label, text, isOn) {
+  const on = isOn ?? (text === "online");
+  const el = $(id);
+  el.className = "pill " + (on ? "on" : "off");
+  el.innerHTML = `<span class="dot"></span>${label}: ${text}`;
+}
+
+function log(topic, text) {
+  const tr = document.createElement("tr");
+  // show "A · qmp/pressure" instead of the full topic with the long username
+  const who = topic.startsWith(A) ? "A" : topic.startsWith(B) ? "B" : topic.startsWith(C) ? "C" : "?";
+  const short = who + " · " + topic.split("/").slice(3).join("/");
+  [new Date().toLocaleTimeString([], { hour12: false }), short, text].forEach(t => {
+    const td = document.createElement("td"); td.textContent = t; td.title = t; tr.appendChild(td);
+  });
+  const body = $("log");
+  body.prepend(tr);
+  while (body.rows.length > CONFIG.logRows) body.deleteRow(-1);
+}
+
+// ===================== audio =====================
+// Payload: signed 16-bit little-endian PCM, mono, CONFIG.clipRate Hz.
+function addClip(bytes) {
+  const n = Math.floor(bytes.length / 2);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, n * 2);
+  const samples = new Int16Array(n);
+  for (let i = 0; i < n; i++) samples[i] = view.getInt16(i * 2, true);
+  clips.unshift({ at: new Date(), samples });
+  if (clips.length > CONFIG.maxClips) clips.pop();
+  renderClips();
+}
+
+function renderClips() {
+  const ul = $("clips");
+  ul.innerHTML = "";
+  clips.forEach((c, i) => {
+    const li = document.createElement("li");
+    const secs = (c.samples.length / CONFIG.clipRate).toFixed(2);
+    li.innerHTML = `<span>${c.at.toLocaleTimeString([], { hour12: false })} · ${secs} s</span>`;
+    const span = document.createElement("span");
+    const play = document.createElement("button"); play.textContent = "Play";
+    play.onclick = () => playClip(c.samples);
+    const save = document.createElement("button"); save.textContent = "Save .wav";
+    save.onclick = () => saveWav(c.samples, `clip_${i + 1}.wav`);
+    span.append(play, " ", save);
+    li.appendChild(span);
+    ul.appendChild(li);
+  });
+}
+
+function playClip(samples) {
+  audioCtx = audioCtx || new AudioContext();   // created on a click, as browsers require
+  const buf = audioCtx.createBuffer(1, samples.length, CONFIG.clipRate);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < samples.length; i++) ch[i] = samples[i] / 32768;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  src.start();
+}
+
+function saveWav(samples, name) {
+  const dataBytes = samples.length * 2, v = new DataView(new ArrayBuffer(44 + dataBytes));
+  const str = (o, s) => [...s].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, "RIFF"); v.setUint32(4, 36 + dataBytes, true); str(8, "WAVE");
+  str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, CONFIG.clipRate, true); v.setUint32(28, CONFIG.clipRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, dataBytes, true);
+  samples.forEach((s, i) => v.setInt16(44 + i * 2, s, true));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([v], { type: "audio/wav" }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ===================== start =====================
+try { $("user").value = localStorage.getItem("a4-user") || CONFIG.defaultUser; }
+catch (e) { $("user").value = CONFIG.defaultUser; }
+$("login").addEventListener("submit", ev => {
+  ev.preventDefault();
+  const user = $("user").value.trim();
+  try { localStorage.setItem("a4-user", user); } catch (e) {}
+  connect(user, $("pass").value);   // the password is never stored
+});
+render();
+window.handleMessage = handleMessage;  // lets you inject a test message from the browser console
+</script>
+</body>
+</html>
