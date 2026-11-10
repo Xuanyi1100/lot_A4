@@ -1,10 +1,21 @@
-
-/*
+ /*
  * FILE          : main.cpp
  * PROJECT       : SENG3030 Assignment 4 - Device C (Control)
  * PROGRAMMERS   : Alexia Tu, Carlos Gomez Guerrero, Deyi Zou, Juan Jose Bejarano
- * FIRST VERSION : 2026-11-05
+ * DATE          : 2026-11-10
  * DESCRIPTION   : Main entry point for Device C.
+ *   Controls device A and device B through MQTT. Publishes under
+ *   SENG3030/Wednesday/<USER_CTRL>/ :
+ *
+ *     Button              Topic             Payload        Retained   Effect
+ *     BtnA click          control/display   "next"         no         B shows the next page
+ *     BtnB click          control/display   "prev"         no         B shows the previous page
+ *     BtnA hold           control/data      "on" / "off"   yes        A starts / stops publishing
+ *     BtnB hold           control/audio     "send"         no         A publishes its audio buffer
+ *
+ *   control/data is retained so A gets the last setting after a reboot.
+ *   When C connects, it publishes its own setting (ON after power-up).
+ *   "status" is "online" while connected; Last Will publishes "offline".
  */
 
 #include <M5Unified.h>
